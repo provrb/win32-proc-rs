@@ -19,7 +19,7 @@ use windows::{
         Foundation::{FALSE, HMODULE, INVALID_HANDLE_VALUE, TRUE},
         System::{
             ProcessStatus::{
-                EnumProcessModules, GetModuleBaseNameA, GetModuleFileNameExA, GetProcessMemoryInfo,
+                EnumProcessModules, GetModuleBaseNameA, GetProcessMemoryInfo,
                 PROCESS_MEMORY_COUNTERS,
             },
             Threading::{

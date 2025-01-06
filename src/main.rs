@@ -11,6 +11,7 @@ fn main() -> Result<(), std::io::Error> {
     //     }
     // }
 
+    // getting memory usage for a processes
     // let mut all_processes = Process::get_processes();
     // for process in all_processes.iter_mut() {
     //     println!("{} -> {} {} ", process.parent_pid, process.pid, process.get_process_name());
@@ -22,14 +23,15 @@ fn main() -> Result<(), std::io::Error> {
     //     }
     // }
 
-    for process in Process::get_processes() {
-        match Process::get_loaded_modules(&process.pid) {
-            Ok(vector) => {
-                println!("{:?}", vector);
-            }
-            _ => {}
-        }
-    }
+    // getting all loaded dlls in each process
+    // for process in Process::get_processes() {
+    //     match Process::get_loaded_modules(&process.pid) {
+    //         Ok(vector) => {
+    //             println!("{:?}", vector);
+    //         }
+    //         _ => {}
+    //     }
+    // }
 
     Ok(())
 }
