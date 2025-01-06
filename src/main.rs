@@ -22,11 +22,14 @@ fn main() -> Result<(), std::io::Error> {
     //     }
     // }
 
-    // for process in Process::get_top_level_processes() {
-    //     println!("{}", process);
-    // }
-
-    
+    for process in Process::get_processes() {
+        match Process::get_loaded_modules(&process.pid) {
+            Ok(vector) => {
+                println!("{:?}", vector);
+            }
+            _ => {}
+        }
+    }
 
     Ok(())
 }

@@ -13,16 +13,22 @@ use winapi::{
     },
 };
 
-use windows::{core::HRESULT, Win32::{
-    Foundation::{FALSE, HMODULE, INVALID_HANDLE_VALUE, TRUE},
-    System::{
-        ProcessStatus::{EnumProcessModules, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
-        Threading::{
-            OpenProcess, TerminateProcess, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE,
-            PROCESS_VM_READ,
+use windows::{
+    core::HRESULT,
+    Win32::{
+        Foundation::{FALSE, HMODULE, INVALID_HANDLE_VALUE, TRUE},
+        System::{
+            ProcessStatus::{
+                EnumProcessModules, GetModuleBaseNameA, GetModuleFileNameExA, GetProcessMemoryInfo,
+                PROCESS_MEMORY_COUNTERS,
+            },
+            Threading::{
+                OpenProcess, TerminateProcess, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE,
+                PROCESS_VM_READ,
+            },
         },
     },
-}};
+};
 
 // process identifiers are u32
 type Pid = u32;
@@ -384,6 +390,14 @@ impl Process {
         top_level_processes
     }
 
+    /// Terminates the specified process by its process ID (PID).
+    ///
+    /// # Arguments
+    /// - `pid` The process ID (PID) of the process to terminate.
+    ///
+    /// # Returns
+    /// Ok(()) if the process was successfully terminated.
+    /// Err(std::io::Error)` if an error occurred while opening or terminating the process.
     pub fn kill_process(pid: &Pid) -> Result<(), std::io::Error> {
         let process = unsafe { OpenProcess(PROCESS_TERMINATE, false, *pid) }
             .map_err(|_| std::io::Error::new(ErrorKind::Other, "Failed to open process"))?;
@@ -404,27 +418,59 @@ impl Process {
         Ok(())
     }
 
+    /// Retrieves a list of all loaded modules (DLLs) for the specified process.
+    ///
+    /// # Arguments
+    /// - `pid` The process ID (PID) of the process whose loaded modules are to be retrieved.
+    ///
+    /// # Returns
+    /// A `Result` containing:
+    /// - `Ok(Vec<String>)` A vector of strings representing the names of all loaded DLLs.
+    /// - `Err(windows::core::Error)` An error if the process could not be opened or modules could not be enumerated.
     pub fn get_loaded_modules(pid: &Pid) -> Result<Vec<String>, windows::core::Error> {
         let handle =
             unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, *pid)? };
-        let modules: HMODULE = unsafe { mem::zeroed() };
-        let cb: u32 = 0;
+        let mut modules: Vec<HMODULE> = vec![HMODULE::default(); 1024];
+        let mut needed: u32 = 0;
+
         let success = unsafe {
             EnumProcessModules(
                 handle,
-                modules.0 as *mut HMODULE,
-                size_of_val::<HMODULE>(&modules) as u32,
-                cb as *mut u32,
+                modules.as_mut_ptr(),
+                (modules.len() * size_of::<HMODULE>()) as u32,
+                &mut needed,
             )
         };
 
         if success.is_err() {
             unsafe { CloseHandle(handle.0 as *mut c_void) };
-            return Err(windows::core::Error::new(HRESULT::default(), "Failed to enumerate process modules"));
+            return Err(windows::core::Error::new(
+                HRESULT::default(),
+                "Failed to enumerate process modules",
+            ));
         }
-        
-        
 
-        Ok(Vec::new())
+        // calculate space needed for all modules
+        // get count of HMODULES by dividing needed
+        let module_count = needed as usize / size_of::<HMODULE>();
+        modules.resize(module_count, HMODULE::default());
+
+        let mut module_names = Vec::new();
+
+        // get all loaded dlls/modules
+        for module in &modules[1..] {
+            let mut name_buffer = vec![0u8; MAX_PATH];
+            unsafe { GetModuleBaseNameA(handle, *module, &mut name_buffer) };
+
+            if let Ok(name) = String::from_utf8(name_buffer) {
+                module_names.push(name.trim_end_matches('\0').to_string());
+            }
+        }
+
+        unsafe {
+            CloseHandle(handle.0 as *mut c_void);
+        }
+
+        Ok(module_names)
     }
 }
