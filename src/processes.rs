@@ -38,7 +38,7 @@ const BYTES_PER_KB: u32 = 1024;
 const BYTES_PER_GB: u64 = 1024 * 1024 * 1024; // 1,073,741,824 bytes per gb. convert from b to gb
 const BYTES_PER_MB: u64 = 1024 * 1024;
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, PartialEq)]
 pub(crate) struct MemoryInner {
     pub working_set_size: usize,    // current memory usage for process
     pub peak_set_size: usize,       // peak memory usage for process,
@@ -46,12 +46,12 @@ pub(crate) struct MemoryInner {
     pub peak_page_file_size: usize, // peak virtual memory used backed by page file
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, PartialEq)]
 pub struct Memory {
     inner: MemoryInner,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct Process {
     pub pid: Pid,                  // process id
     pub child_threads: Pid,        // number of child threads started by the process
@@ -257,6 +257,14 @@ impl Process {
             process_entry.pcPriClassBase,
             Memory::new(),
         )
+    }
+
+    pub fn from_pid(pid: &Pid) -> Process {
+        if let Some(proc) = Self::get_processes_as_map(Self::get_processes()).get(pid) {
+            return proc.clone()
+        } 
+        
+        Process::default()
     }
 
     /// Retrieves the process name from the `exe_path`, removing null terminators.
