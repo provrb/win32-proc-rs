@@ -1,19 +1,31 @@
 use core::fmt;
-use std::{collections::HashMap, mem};
+use std::{collections::HashMap, io::ErrorKind, mem};
 
 use winapi::{
-    shared::minwindef::MAX_PATH, 
-    um::{ tlhelp32::{self, CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W}, winnt::HANDLE }
+    ctypes::c_void,
+    shared::minwindef::MAX_PATH,
+    um::{
+        handleapi::CloseHandle,
+        tlhelp32::{
+            self, CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        },
+        winnt::HANDLE,
+    },
 };
 
-use windows::Win32:: {
-    Foundation::{FALSE, INVALID_HANDLE_VALUE, TRUE}, 
-    System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
-    System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
-};
+use windows::{core::HRESULT, Win32::{
+    Foundation::{FALSE, HMODULE, INVALID_HANDLE_VALUE, TRUE},
+    System::{
+        ProcessStatus::{EnumProcessModules, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+        Threading::{
+            OpenProcess, TerminateProcess, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE,
+            PROCESS_VM_READ,
+        },
+    },
+}};
 
 // process identifiers are u32
-type PID = u32;
+type Pid = u32;
 
 // conversion factors
 const BYTES_PER_KB: u32 = 1024;
@@ -22,45 +34,44 @@ const BYTES_PER_MB: u64 = 1024 * 1024;
 
 #[derive(Default, Clone)]
 pub(crate) struct MemoryInner {
-    pub working_set_size: usize, // current memory usage for process
-    pub peak_set_size: usize, // peak memory usage for process,
-    pub page_file_size: usize, // virtual memory allocated for process
+    pub working_set_size: usize,    // current memory usage for process
+    pub peak_set_size: usize,       // peak memory usage for process,
+    pub page_file_size: usize,      // virtual memory allocated for process
     pub peak_page_file_size: usize, // peak virtual memory used backed by page file
 }
 
-#[derive(Clone)]
+#[derive(Default, Clone)]
 pub struct Memory {
-    inner: MemoryInner
+    inner: MemoryInner,
 }
 
 #[derive(Clone)]
 pub struct Process {
-    pub pid: PID, // process id
-    pub child_threads: PID, // number of child threads started by the process
-    pub parent_pid: PID, // process id of this processes parent
+    pub pid: Pid,                  // process id
+    pub child_threads: Pid,        // number of child threads started by the process
+    pub parent_pid: Pid,           // process id of this processes parent
     pub exe_path: [u16; MAX_PATH], // path of the exe of the process
     pub thread_base_priority: i32, // base priority of any child threads
-    pub process_memory: Memory, // memory usage for a process
+    pub process_memory: Memory,    // memory usage for a process
 }
 
 impl MemoryInner {
     // construct a MemoryInner description
     // from win32 api 'PROCESS_MEMORY_COUNTERS' struct
-    pub fn from_memory_counters(
-        mem_info: &PROCESS_MEMORY_COUNTERS
-    ) -> Self {
-        Self { 
-            working_set_size: mem_info.WorkingSetSize, 
-            peak_set_size: mem_info.PeakWorkingSetSize, 
-            page_file_size: mem_info.PagefileUsage, 
-            peak_page_file_size: mem_info.PeakPagefileUsage 
+    pub fn from_memory_counters(mem_info: &PROCESS_MEMORY_COUNTERS) -> Self {
+        Self {
+            working_set_size: mem_info.WorkingSetSize,
+            peak_set_size: mem_info.PeakWorkingSetSize,
+            page_file_size: mem_info.PagefileUsage,
+            peak_page_file_size: mem_info.PeakPagefileUsage,
         }
     }
 }
 
 impl fmt::Display for Memory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, 
+        write!(
+            f,
             "Memory Usage:        {} MB\n\
             Peak Memory Usage:   {} MB\n\
             Page File Size:      {} MB\n\
@@ -75,13 +86,13 @@ impl fmt::Display for Memory {
 
 impl Default for Process {
     fn default() -> Self {
-        Self { 
-            pid: 0, 
-            child_threads: 0, 
-            parent_pid: 0, 
-            exe_path: [0; MAX_PATH], 
+        Self {
+            pid: 0,
+            child_threads: 0,
+            parent_pid: 0,
+            exe_path: [0; MAX_PATH],
             thread_base_priority: 0,
-            process_memory: Memory::new()
+            process_memory: Memory::new(),
         }
     }
 }
@@ -111,8 +122,8 @@ impl Memory {
     /// # Returns
     /// A new `Memory` instance with all memory values set to their default state.
     pub fn new() -> Self {
-        Self { 
-            inner: MemoryInner::default()
+        Self {
+            inner: MemoryInner::default(),
         }
     }
 
@@ -134,7 +145,7 @@ impl Memory {
     /// # Returns
     /// The current working set size, representing the amount of memory currently being used, in megabytes.
     pub fn current_mem_usage_mb(&self) -> u64 {
-        return self.inner.working_set_size as u64 / BYTES_PER_MB;
+        self.inner.working_set_size as u64 / BYTES_PER_MB
     }
 
     /// Retrieves the current page file usage in megabytes.
@@ -142,7 +153,7 @@ impl Memory {
     /// # Returns
     /// The amount of memory being used in the page file, in megabytes.
     pub fn page_file_usage_mb(&self) -> u64 {
-        return self.inner.page_file_size as u64 / BYTES_PER_MB;
+        self.inner.page_file_size as u64 / BYTES_PER_MB
     }
 
     /// Retrieves the maximum memory usage recorded in megabytes.
@@ -150,7 +161,7 @@ impl Memory {
     /// # Returns
     /// The peak working set size, representing the maximum amount of memory used, in megabytes.
     pub fn max_mem_usage_mb(&self) -> u64 {
-        return self.inner.peak_set_size as u64 / BYTES_PER_MB;
+        self.inner.peak_set_size as u64 / BYTES_PER_MB
     }
 
     /// Retrieves the maximum page file usage recorded in megabytes.
@@ -158,7 +169,7 @@ impl Memory {
     /// # Returns
     /// The peak amount of memory used in the page file, in megabytes.
     pub fn max_page_file_usage_mb(&self) -> u64 {
-        return self.inner.peak_page_file_size as u64 / BYTES_PER_MB;
+        self.inner.peak_page_file_size as u64 / BYTES_PER_MB
     }
 }
 
@@ -176,20 +187,20 @@ impl Process {
     /// # Returns
     /// A new `Process` instance.
     pub fn new(
-        pid: u32, 
-        child_threads: u32, 
+        pid: u32,
+        child_threads: u32,
         parent_pid: u32,
         exe_path: [u16; MAX_PATH],
         thread_base_priority: i32,
-        process_memory: Memory
+        process_memory: Memory,
     ) -> Self {
-        Self { 
-            pid, 
-            child_threads, 
-            parent_pid, 
-            exe_path, 
+        Self {
+            pid,
+            child_threads,
+            parent_pid,
+            exe_path,
             thread_base_priority,
-            process_memory
+            process_memory,
         }
     }
 
@@ -198,26 +209,30 @@ impl Process {
     /// # Returns
     /// An `Option<Memory>` containing the memory usage details of the process. Returns `None` if memory usage couldn't be retrieved.
     pub fn get_memory_usage(&mut self) -> Option<Memory> {
-        let opened = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, self.pid) };
+        let opened =
+            unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, self.pid) };
         let mut mem_info = PROCESS_MEMORY_COUNTERS::default();
+
         match opened {
             Ok(handle) => {
-                let result = unsafe { GetProcessMemoryInfo(
-                    handle,
-                    &mut mem_info as *mut PROCESS_MEMORY_COUNTERS,
-                    size_of_val::<PROCESS_MEMORY_COUNTERS>(&mem_info) as u32
-                ) };
+                let result = unsafe {
+                    GetProcessMemoryInfo(
+                        handle,
+                        &mut mem_info as *mut PROCESS_MEMORY_COUNTERS,
+                        size_of_val::<PROCESS_MEMORY_COUNTERS>(&mem_info) as u32,
+                    )
+                };
+
+                unsafe { CloseHandle(handle.0 as *mut c_void) };
 
                 if result.is_err() {
                     return None;
                 }
             }
-            Err(_) => {
-                return None;
-            }
+            _ => return None,
         }
 
-        return Some(Memory::new_from_counters(&mem_info));
+        Some(Memory::new_from_counters(&mem_info))
     }
 
     /// Converts a `PROCESSENTRY32W` structure to a `Process` instance.
@@ -227,16 +242,14 @@ impl Process {
     ///
     /// # Returns
     /// A `Process` instance populated with data from the `PROCESSENTRY32W`.
-    pub fn from_process_entry(
-        process_entry: &PROCESSENTRY32W
-    ) -> Self {
+    pub fn from_process_entry(process_entry: &PROCESSENTRY32W) -> Self {
         Self::new(
-            process_entry.th32ProcessID, 
-            process_entry.cntThreads, 
-            process_entry.th32ParentProcessID, 
-            process_entry.szExeFile, 
+            process_entry.th32ProcessID,
+            process_entry.cntThreads,
+            process_entry.th32ParentProcessID,
+            process_entry.szExeFile,
             process_entry.pcPriClassBase,
-            Memory::new()
+            Memory::new(),
         )
     }
 
@@ -257,13 +270,13 @@ impl Process {
     ///
     /// # Returns
     /// A `HashMap` where the key is a process ID (`PID`), and the value is the corresponding `Process`.
-    pub fn get_processes_as_map(processes: Vec<Process>) -> HashMap<PID, Process> {
-        let mut map: HashMap<PID, Process> = HashMap::new();
+    pub fn get_processes_as_map(processes: Vec<Process>) -> HashMap<Pid, Process> {
+        let mut map: HashMap<Pid, Process> = HashMap::new();
 
         for process in processes {
             map.insert(process.pid, process);
         }
-        
+
         map
     }
 
@@ -275,16 +288,21 @@ impl Process {
     /// - `parent_to_children`: A reference to a `HashMap` that maps parent PIDs to child PIDs.
     /// - `indent`: The number of spaces to indent each level of the hierarchy.
     pub fn print_process_hierarchy(
-        pid: PID,
-        all_processes: &HashMap<PID, Process>,
-        parent_to_children: &HashMap<PID, Vec<PID>>,
+        pid: Pid,
+        all_processes: &HashMap<Pid, Process>,
+        parent_to_children: &HashMap<Pid, Vec<Pid>>,
         indent: usize,
     ) {
         if let Some(process) = all_processes.get(&pid) {
             println!("{}{}", " ".repeat(indent), process.get_process_name());
             if let Some(children) = parent_to_children.get(&pid) {
                 for &child_pid in children {
-                    Self::print_process_hierarchy(child_pid, all_processes, parent_to_children, indent + 4);
+                    Self::print_process_hierarchy(
+                        child_pid,
+                        all_processes,
+                        parent_to_children,
+                        indent + 4,
+                    );
                 }
             }
         }
@@ -300,12 +318,14 @@ impl Process {
         if snapshot == INVALID_HANDLE_VALUE.0 as HANDLE {
             return Vec::new();
         }
-        
+
         let mut process_entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
         process_entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
-        
+
         // process first entry, add it to process list
-        if unsafe { Process32FirstW(snapshot, &mut process_entry as *mut PROCESSENTRY32W) } == FALSE.0 {
+        if unsafe { Process32FirstW(snapshot, &mut process_entry as *mut PROCESSENTRY32W) }
+            == FALSE.0
+        {
             return Vec::new();
         }
 
@@ -316,9 +336,11 @@ impl Process {
         processes.push(Process::from_process_entry(&process_entry));
 
         // iterate through all processes
-        while unsafe { Process32NextW(snapshot, &mut process_entry as *mut PROCESSENTRY32W) } == TRUE.0 {
+        while unsafe { Process32NextW(snapshot, &mut process_entry as *mut PROCESSENTRY32W) }
+            == TRUE.0
+        {
             processes.push(Process::from_process_entry(&process_entry));
-        }   
+        }
 
         processes
     }
@@ -330,16 +352,14 @@ impl Process {
     ///
     /// # Returns
     /// A `HashMap` that maps parent PIDs to a vector of child PIDs.
-    pub fn create_relationships(
-        process_list: &HashMap<PID, Process>
-    ) -> HashMap<PID, Vec<PID>> {
-        // parent pid : { children pid's } 
-        let mut parent_to_children: HashMap<PID, Vec<PID>> = HashMap::new();
+    pub fn create_relationships(process_list: &HashMap<Pid, Process>) -> HashMap<Pid, Vec<Pid>> {
+        // parent pid : { children pid's }
+        let mut parent_to_children: HashMap<Pid, Vec<Pid>> = HashMap::new();
 
         for process in process_list.values() {
             parent_to_children
                 .entry(process.parent_pid)
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(process.pid);
         }
 
@@ -353,8 +373,8 @@ impl Process {
     pub fn get_top_level_processes() -> Vec<Process> {
         let mut top_level_processes: Vec<Process> = Vec::new();
         let all_processes = Self::get_processes();
-        let process_map: HashMap<PID, Process> = Self::get_processes_as_map(all_processes.clone());
-        
+        let process_map: HashMap<Pid, Process> = Self::get_processes_as_map(all_processes.clone());
+
         for process in all_processes.iter() {
             if !process_map.contains_key(&process.parent_pid) {
                 top_level_processes.push(process.clone());
@@ -362,5 +382,49 @@ impl Process {
         }
 
         top_level_processes
+    }
+
+    pub fn kill_process(pid: &Pid) -> Result<(), std::io::Error> {
+        let process = unsafe { OpenProcess(PROCESS_TERMINATE, false, *pid) }
+            .map_err(|_| std::io::Error::new(ErrorKind::Other, "Failed to open process"))?;
+
+        unsafe {
+            let term = TerminateProcess(process, 0);
+            if term.is_err() {
+                CloseHandle(process.0 as *mut c_void);
+                return Err(std::io::Error::new(
+                    ErrorKind::Other,
+                    "Failed to terminate process",
+                ));
+            }
+
+            CloseHandle(process.0 as *mut c_void);
+        }
+
+        Ok(())
+    }
+
+    pub fn get_loaded_modules(pid: &Pid) -> Result<Vec<String>, windows::core::Error> {
+        let handle =
+            unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, *pid)? };
+        let modules: HMODULE = unsafe { mem::zeroed() };
+        let cb: u32 = 0;
+        let success = unsafe {
+            EnumProcessModules(
+                handle,
+                modules.0 as *mut HMODULE,
+                size_of_val::<HMODULE>(&modules) as u32,
+                cb as *mut u32,
+            )
+        };
+
+        if success.is_err() {
+            unsafe { CloseHandle(handle.0 as *mut c_void) };
+            return Err(windows::core::Error::new(HRESULT::default(), "Failed to enumerate process modules"));
+        }
+        
+        
+
+        Ok(Vec::new())
     }
 }

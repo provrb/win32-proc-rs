@@ -1,7 +1,6 @@
 use process_explorer_2::processes::Process;
 
 fn main() -> Result<(), std::io::Error> {
-    
     // printing all processes
     // let all_processes = unsafe { Process::get_processes_as_map() };
     // let relationships = Process::create_relationships(&all_processes);
@@ -27,6 +26,7 @@ fn main() -> Result<(), std::io::Error> {
     //     println!("{}", process);
     // }
 
+    
+
     Ok(())
 }
-
