@@ -595,6 +595,4 @@ impl Process {
 
         Ok(module_names)
     }
-
-    
 }
