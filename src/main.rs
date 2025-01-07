@@ -2,14 +2,14 @@ use process_explorer_2::processes::Process;
 
 fn main() -> Result<(), std::io::Error> {
     // printing all processes
-    // let all_processes = unsafe { Process::get_processes_as_map() };
-    // let relationships = Process::create_relationships(&all_processes);
+    let all_processes = Process::get_processes_as_map(Process::get_processes());
+    let relationships = Process::create_relationships(&all_processes);
 
-    // for process in all_processes.values() {
-    //     if !all_processes.contains_key(&process.parent_pid) {
-    //         Process::print_process_hierarchy(process.pid, &all_processes, &relationships, 0);
-    //     }
-    // }
+    for process in all_processes.values() {
+        if !all_processes.contains_key(&process.parent_pid) {
+            Process::print_process_hierarchy(process.pid, &all_processes, &relationships, 0);
+        }
+    }
 
     // getting memory usage for a processes
     // let mut all_processes = Process::get_processes();

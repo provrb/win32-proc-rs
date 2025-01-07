@@ -1,5 +1,13 @@
+/// Windows 32 Process Handler
+///
+/// Use Process to access functions relating to processes
+/// such as get all processes, kill processes, etc
 use core::fmt;
-use std::{collections::HashMap, io::ErrorKind, mem};
+use std::{
+    collections::HashMap,
+    io::{Error, ErrorKind},
+    mem,
+};
 
 use winapi::{
     ctypes::c_void,
@@ -9,21 +17,20 @@ use winapi::{
         tlhelp32::{
             self, CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         },
-        winnt::HANDLE,
     },
 };
 
 use windows::{
     core::HRESULT,
     Win32::{
-        Foundation::{FALSE, HMODULE, INVALID_HANDLE_VALUE, TRUE},
+        Foundation::{FALSE, HANDLE, HMODULE, TRUE},
         System::{
             ProcessStatus::{
                 EnumProcessModules, GetModuleBaseNameA, GetProcessMemoryInfo,
                 PROCESS_MEMORY_COUNTERS,
             },
             Threading::{
-                OpenProcess, TerminateProcess, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE,
+                OpenProcess, TerminateProcess, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_INFORMATION,
                 PROCESS_VM_READ,
             },
         },
@@ -74,6 +81,7 @@ impl MemoryInner {
     }
 }
 
+// Print out all details about a memory object
 impl fmt::Display for Memory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -90,6 +98,7 @@ impl fmt::Display for Memory {
     }
 }
 
+// Default values for process
 impl Default for Process {
     fn default() -> Self {
         Self {
@@ -103,6 +112,7 @@ impl Default for Process {
     }
 }
 
+// Print out all values of a process aligned
 impl fmt::Display for Process {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -118,6 +128,63 @@ impl fmt::Display for Process {
             self.parent_pid,
             self.thread_base_priority
         )
+    }
+}
+
+/// Implementation of the `HandleManager` trait for `HANDLE`.
+pub(crate) trait HandleManager<T> {
+    fn cleanup(handle: T);
+    fn from_process_id(pid: &Pid, access: PROCESS_ACCESS_RIGHTS) -> Option<T>;
+    fn as_mut_c_void(handle: T) -> *mut c_void;
+}
+
+impl HandleManager<HANDLE> for HANDLE {
+    /// Cleans up the given handle by closing it.
+    ///
+    /// # Parameters
+    /// - `handle`: The handle to be closed.
+    ///
+    /// # Safety
+    /// This function is unsafe because it calls the `CloseHandle` function, which can potentially
+    /// close an invalid handle if not used correctly.
+    fn cleanup(handle: HANDLE) {
+        unsafe {
+            CloseHandle(Self::as_mut_c_void(handle));
+        }
+    }
+
+    /// Creates a handle from a process ID with the specified access rights.
+    ///
+    /// # Parameters
+    /// - `pid`: The process ID for which to create the handle.
+    /// - `access`: The access rights for the handle.
+    ///
+    /// # Returns
+    /// An `Option<HANDLE>` containing the handle if successful, or `None` if the handle could not be created.
+    ///
+    /// # Safety
+    /// This function is unsafe because it calls the `OpenProcess` function, which can potentially
+    /// open a handle to a process with insufficient or incorrect access rights.
+    fn from_process_id(pid: &Pid, access: PROCESS_ACCESS_RIGHTS) -> Option<HANDLE> {
+        let res = unsafe { OpenProcess(access, false, *pid) };
+
+        if res.is_err() {
+            return None;
+        }
+
+        let handle = res.unwrap();
+        Some(handle)
+    }
+
+    /// Converts a handle to a mutable pointer to `c_void`.
+    ///
+    /// # Parameters
+    /// - `handle`: The handle to be converted.
+    ///
+    /// # Returns
+    /// A mutable pointer to `c_void` representing the handle.
+    fn as_mut_c_void(handle: HANDLE) -> *mut c_void {
+        handle.0 as *mut c_void
     }
 }
 
@@ -215,27 +282,22 @@ impl Process {
     /// # Returns
     /// An `Option<Memory>` containing the memory usage details of the process. Returns `None` if memory usage couldn't be retrieved.
     pub fn get_memory_usage(&mut self) -> Option<Memory> {
-        let opened =
-            unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, self.pid) };
+        let handle =
+            HANDLE::from_process_id(&self.pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)?;
         let mut mem_info = PROCESS_MEMORY_COUNTERS::default();
 
-        match opened {
-            Ok(handle) => {
-                let result = unsafe {
-                    GetProcessMemoryInfo(
-                        handle,
-                        &mut mem_info as *mut PROCESS_MEMORY_COUNTERS,
-                        size_of_val::<PROCESS_MEMORY_COUNTERS>(&mem_info) as u32,
-                    )
-                };
+        let result = unsafe {
+            GetProcessMemoryInfo(
+                handle,
+                &mut mem_info as *mut PROCESS_MEMORY_COUNTERS,
+                size_of_val::<PROCESS_MEMORY_COUNTERS>(&mem_info) as u32,
+            )
+        };
 
-                unsafe { CloseHandle(handle.0 as *mut c_void) };
+        HANDLE::cleanup(handle);
 
-                if result.is_err() {
-                    return None;
-                }
-            }
-            _ => return None,
+        if result.is_err() {
+            return None;
         }
 
         Some(Memory::new_from_counters(&mem_info))
@@ -259,12 +321,39 @@ impl Process {
         )
     }
 
+    /// Get a Process struct from a process ID
+    ///
+    /// # Parameters
+    /// - 'pid': The pid of the process to search for
+    ///
+    /// # Returns
+    /// A 'Process' instance describing the process with 'pid'
     pub fn from_pid(pid: &Pid) -> Process {
         if let Some(proc) = Self::get_processes_as_map(Self::get_processes()).get(pid) {
-            return proc.clone()
-        } 
-        
+            return proc.clone();
+        }
+
         Process::default()
+    }
+
+    /// Get all processes with 'name'
+    ///
+    /// # Parameters
+    /// - 'name': The name of the processes to retrieve
+    ///
+    /// # Returns
+    /// A vector of Process structs describing all processes found with 'name'
+    pub fn from_proc_name(name: &str) -> Vec<Process> {
+        let all_processes = Self::get_processes();
+        let mut processes: Vec<Process> = Vec::new();
+
+        for process in all_processes {
+            if process.get_process_name() == name {
+                processes.push(process);
+            }
+        }
+
+        processes
     }
 
     /// Retrieves the process name from the `exe_path`, removing null terminators.
@@ -328,8 +417,10 @@ impl Process {
     /// A vector of `Process` instances representing all currently running processes.
     pub fn get_processes() -> Vec<Process> {
         // take a snapshot of all current processes
-        let snapshot: HANDLE = unsafe { CreateToolhelp32Snapshot(tlhelp32::TH32CS_SNAPPROCESS, 0) };
-        if snapshot == INVALID_HANDLE_VALUE.0 as HANDLE {
+        let snapshot: HANDLE =
+            unsafe { HANDLE(CreateToolhelp32Snapshot(tlhelp32::TH32CS_SNAPPROCESS, 0) as isize) };
+
+        if snapshot.is_invalid() {
             return Vec::new();
         }
 
@@ -337,9 +428,14 @@ impl Process {
         process_entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
 
         // process first entry, add it to process list
-        if unsafe { Process32FirstW(snapshot, &mut process_entry as *mut PROCESSENTRY32W) }
-            == FALSE.0
+        if unsafe {
+            Process32FirstW(
+                HANDLE::as_mut_c_void(snapshot),
+                &mut process_entry as *mut PROCESSENTRY32W,
+            )
+        } == FALSE.0
         {
+            HANDLE::cleanup(snapshot);
             return Vec::new();
         }
 
@@ -350,11 +446,17 @@ impl Process {
         processes.push(Process::from_process_entry(&process_entry));
 
         // iterate through all processes
-        while unsafe { Process32NextW(snapshot, &mut process_entry as *mut PROCESSENTRY32W) }
-            == TRUE.0
+        while unsafe {
+            Process32NextW(
+                HANDLE::as_mut_c_void(snapshot),
+                &mut process_entry as *mut PROCESSENTRY32W,
+            )
+        } == TRUE.0
         {
             processes.push(Process::from_process_entry(&process_entry));
         }
+
+        HANDLE::cleanup(snapshot);
 
         processes
     }
@@ -407,20 +509,27 @@ impl Process {
     /// Ok(()) if the process was successfully terminated.
     /// Err(std::io::Error)` if an error occurred while opening or terminating the process.
     pub fn kill_process(pid: &Pid) -> Result<(), std::io::Error> {
-        let process = unsafe { OpenProcess(PROCESS_TERMINATE, false, *pid) }
-            .map_err(|_| std::io::Error::new(ErrorKind::Other, "Failed to open process"))?;
+        let process = HANDLE::from_process_id(pid, PROCESS_VM_READ | PROCESS_QUERY_INFORMATION);
+
+        if process.is_none() {
+            return Err(Error::new(
+                ErrorKind::Other,
+                "Failed to get HANDLE from process ID",
+            ));
+        }
+
+        let handle = process.unwrap();
 
         unsafe {
-            let term = TerminateProcess(process, 0);
+            let term = TerminateProcess(handle, 0);
+            HANDLE::cleanup(handle);
+
             if term.is_err() {
-                CloseHandle(process.0 as *mut c_void);
                 return Err(std::io::Error::new(
                     ErrorKind::Other,
                     "Failed to terminate process",
                 ));
             }
-
-            CloseHandle(process.0 as *mut c_void);
         }
 
         Ok(())
@@ -436,10 +545,17 @@ impl Process {
     /// - `Ok(Vec<String>)` A vector of strings representing the names of all loaded DLLs.
     /// - `Err(windows::core::Error)` An error if the process could not be opened or modules could not be enumerated.
     pub fn get_loaded_modules(pid: &Pid) -> Result<Vec<String>, windows::core::Error> {
-        let handle =
-            unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, *pid)? };
+        let opt = HANDLE::from_process_id(pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ);
         let mut modules: Vec<HMODULE> = vec![HMODULE::default(); 1024];
         let mut needed: u32 = 0;
+        let handle = opt.unwrap_or_default();
+
+        if handle.is_invalid() {
+            return Err(windows::core::Error::new(
+                HRESULT::default(),
+                "Error getting handle from process id",
+            ));
+        }
 
         let success = unsafe {
             EnumProcessModules(
@@ -451,7 +567,7 @@ impl Process {
         };
 
         if success.is_err() {
-            unsafe { CloseHandle(handle.0 as *mut c_void) };
+            HANDLE::cleanup(handle);
             return Err(windows::core::Error::new(
                 HRESULT::default(),
                 "Failed to enumerate process modules",
@@ -475,10 +591,10 @@ impl Process {
             }
         }
 
-        unsafe {
-            CloseHandle(handle.0 as *mut c_void);
-        }
+        HANDLE::cleanup(handle);
 
         Ok(module_names)
     }
+
+    
 }
