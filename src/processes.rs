@@ -9,29 +9,23 @@ use std::{
     mem,
 };
 
-use winapi::{
-    ctypes::c_void,
-    shared::minwindef::MAX_PATH,
-    um::{
-        handleapi::CloseHandle,
-        tlhelp32::{
-            self, CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-        },
-    },
-};
-
 use windows::{
-    core::HRESULT,
+    core::{HRESULT, PCSTR, PSTR},
     Win32::{
-        Foundation::{FALSE, HANDLE, HMODULE, TRUE},
+        Foundation::{CloseHandle, HANDLE, HMODULE, MAX_PATH},
         System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+                TH32CS_SNAPPROCESS,
+            },
             ProcessStatus::{
                 EnumProcessModules, GetModuleBaseNameA, GetProcessMemoryInfo,
-                PROCESS_MEMORY_COUNTERS,
+                PROCESS_MEMORY_COUNTERS_EX,
             },
             Threading::{
-                OpenProcess, TerminateProcess, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_INFORMATION,
-                PROCESS_VM_READ,
+                CreateProcessA, OpenProcess, TerminateProcess, PROCESS_ACCESS_RIGHTS,
+                PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION,
+                PROCESS_VM_READ, STARTUPINFOA,
             },
         },
     },
@@ -45,38 +39,40 @@ const BYTES_PER_KB: u32 = 1024;
 const BYTES_PER_GB: u64 = 1024 * 1024 * 1024; // 1,073,741,824 bytes per gb. convert from b to gb
 const BYTES_PER_MB: u64 = 1024 * 1024;
 
-#[derive(Default, Clone, PartialEq)]
+#[derive(Default, Clone, PartialEq, Debug)]
 pub(crate) struct MemoryInner {
     pub working_set_size: usize,    // current memory usage for process
     pub peak_set_size: usize,       // peak memory usage for process,
     pub page_file_size: usize,      // virtual memory allocated for process
     pub peak_page_file_size: usize, // peak virtual memory used backed by page file
+    pub private_usage: usize,
 }
 
-#[derive(Default, Clone, PartialEq)]
+#[derive(Default, Clone, PartialEq, Debug)]
 pub struct Memory {
     inner: MemoryInner,
 }
 
 #[derive(Clone, PartialEq)]
 pub struct Process {
-    pub pid: Pid,                  // process id
-    pub child_threads: Pid,        // number of child threads started by the process
-    pub parent_pid: Pid,           // process id of this processes parent
-    pub exe_path: [u16; MAX_PATH], // path of the exe of the process
-    pub thread_base_priority: i32, // base priority of any child threads
-    pub process_memory: Memory,    // memory usage for a process
+    pub pid: Pid,                           // process id
+    pub child_threads: Pid,                 // number of child threads started by the process
+    pub parent_pid: Pid,                    // process id of this processes parent
+    pub exe_path: [u16; MAX_PATH as usize], // path of the exe of the process
+    pub thread_base_priority: i32,          // base priority of any child threads
+    pub process_memory: Memory,             // memory usage for a process
 }
 
 impl MemoryInner {
     // construct a MemoryInner description
     // from win32 api 'PROCESS_MEMORY_COUNTERS' struct
-    pub fn from_memory_counters(mem_info: &PROCESS_MEMORY_COUNTERS) -> Self {
+    pub fn from_memory_counters(mem_info: &PROCESS_MEMORY_COUNTERS_EX) -> Self {
         Self {
             working_set_size: mem_info.WorkingSetSize,
             peak_set_size: mem_info.PeakWorkingSetSize,
             page_file_size: mem_info.PagefileUsage,
             peak_page_file_size: mem_info.PeakPagefileUsage,
+            private_usage: mem_info.PrivateUsage,
         }
     }
 }
@@ -89,11 +85,13 @@ impl fmt::Display for Memory {
             "Memory Usage:        {} MB\n\
             Peak Memory Usage:   {} MB\n\
             Page File Size:      {} MB\n\
-            Peak Page File Size: {} MB\n",
+            Peak Page File Size: {} MB\n\"
+            Private Usage:       {} B\n",
             self.current_mem_usage_mb(),
             self.max_mem_usage_mb(),
             self.page_file_usage_mb(),
             self.max_page_file_usage_mb(),
+            self.inner.private_usage
         )
     }
 }
@@ -105,7 +103,7 @@ impl Default for Process {
             pid: 0,
             child_threads: 0,
             parent_pid: 0,
-            exe_path: [0; MAX_PATH],
+            exe_path: [0; MAX_PATH as usize],
             thread_base_priority: 0,
             process_memory: Memory::new(),
         }
@@ -131,63 +129,6 @@ impl fmt::Display for Process {
     }
 }
 
-/// Implementation of the `HandleManager` trait for `HANDLE`.
-pub(crate) trait HandleManager<T> {
-    fn cleanup(handle: T);
-    fn from_process_id(pid: &Pid, access: PROCESS_ACCESS_RIGHTS) -> Option<T>;
-    fn as_mut_c_void(handle: T) -> *mut c_void;
-}
-
-impl HandleManager<HANDLE> for HANDLE {
-    /// Cleans up the given handle by closing it.
-    ///
-    /// # Parameters
-    /// - `handle`: The handle to be closed.
-    ///
-    /// # Safety
-    /// This function is unsafe because it calls the `CloseHandle` function, which can potentially
-    /// close an invalid handle if not used correctly.
-    fn cleanup(handle: HANDLE) {
-        unsafe {
-            CloseHandle(Self::as_mut_c_void(handle));
-        }
-    }
-
-    /// Creates a handle from a process ID with the specified access rights.
-    ///
-    /// # Parameters
-    /// - `pid`: The process ID for which to create the handle.
-    /// - `access`: The access rights for the handle.
-    ///
-    /// # Returns
-    /// An `Option<HANDLE>` containing the handle if successful, or `None` if the handle could not be created.
-    ///
-    /// # Safety
-    /// This function is unsafe because it calls the `OpenProcess` function, which can potentially
-    /// open a handle to a process with insufficient or incorrect access rights.
-    fn from_process_id(pid: &Pid, access: PROCESS_ACCESS_RIGHTS) -> Option<HANDLE> {
-        let res = unsafe { OpenProcess(access, false, *pid) };
-
-        if res.is_err() {
-            return None;
-        }
-
-        let handle = res.unwrap();
-        Some(handle)
-    }
-
-    /// Converts a handle to a mutable pointer to `c_void`.
-    ///
-    /// # Parameters
-    /// - `handle`: The handle to be converted.
-    ///
-    /// # Returns
-    /// A mutable pointer to `c_void` representing the handle.
-    fn as_mut_c_void(handle: HANDLE) -> *mut c_void {
-        handle.0 as *mut c_void
-    }
-}
-
 /// Represents memory usage information for a process.
 impl Memory {
     /// Creates a new instance of `Memory` with default values.
@@ -207,7 +148,7 @@ impl Memory {
     ///
     /// # Returns
     /// A new `Memory` instance populated with memory usage data from the provided `PROCESS_MEMORY_COUNTERS`.
-    pub fn new_from_counters(counters: &PROCESS_MEMORY_COUNTERS) -> Self {
+    pub fn new_from_counters(counters: &PROCESS_MEMORY_COUNTERS_EX) -> Self {
         Self {
             inner: MemoryInner::from_memory_counters(counters),
         }
@@ -244,6 +185,14 @@ impl Memory {
     pub fn max_page_file_usage_mb(&self) -> u64 {
         self.inner.peak_page_file_size as u64 / BYTES_PER_MB
     }
+
+    /// Retrieves the virtual memory usage recorded in megabytes.
+    ///
+    /// # Returns
+    /// The virtual memory used in the process, in megabytes.
+    pub fn virtual_memory_mb(&self) -> u64 {
+        self.inner.private_usage as u64 / BYTES_PER_MB
+    }
 }
 
 impl Process {
@@ -263,7 +212,7 @@ impl Process {
         pid: u32,
         child_threads: u32,
         parent_pid: u32,
-        exe_path: [u16; MAX_PATH],
+        exe_path: [u16; MAX_PATH as usize],
         thread_base_priority: i32,
         process_memory: Memory,
     ) -> Self {
@@ -277,24 +226,48 @@ impl Process {
         }
     }
 
+    /// Creates a handle from a process ID with the specified access rights.
+    ///
+    /// # Parameters
+    /// - `pid`: The process ID for which to create the handle.
+    /// - `access`: The access rights for the handle.
+    ///
+    /// # Returns
+    /// An `Option<HANDLE>` containing the handle if successful, or `None` if the handle could not be created.
+    ///
+    /// # Safety
+    /// This function is unsafe because it calls the `OpenProcess` function, which can potentially
+    /// open a handle to a process with insufficient or incorrect access rights.
+    fn open_handle(pid: &Pid, access: PROCESS_ACCESS_RIGHTS) -> Option<HANDLE> {
+        let res = unsafe { OpenProcess(access, false, *pid) };
+
+        if res.is_err() {
+            return None;
+        }
+
+        let handle = res.unwrap();
+        Some(handle)
+    }
+
     /// Retrieves the memory usage information of the process.
     ///
     /// # Returns
     /// An `Option<Memory>` containing the memory usage details of the process. Returns `None` if memory usage couldn't be retrieved.
     pub fn get_memory_usage(&mut self) -> Option<Memory> {
-        let handle =
-            HANDLE::from_process_id(&self.pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)?;
-        let mut mem_info = PROCESS_MEMORY_COUNTERS::default();
+        let handle = Self::open_handle(&self.pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)?;
+        let mut mem_info = PROCESS_MEMORY_COUNTERS_EX::default();
 
         let result = unsafe {
             GetProcessMemoryInfo(
                 handle,
-                &mut mem_info as *mut PROCESS_MEMORY_COUNTERS,
-                size_of_val::<PROCESS_MEMORY_COUNTERS>(&mem_info) as u32,
+                &mut mem_info as *mut _ as *mut _,
+                size_of_val::<PROCESS_MEMORY_COUNTERS_EX>(&mem_info) as u32,
             )
         };
 
-        HANDLE::cleanup(handle);
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
 
         if result.is_err() {
             return None;
@@ -334,6 +307,50 @@ impl Process {
         }
 
         Process::default()
+    }
+
+    /// Open a process using the path of the executable.
+    ///
+    /// # Parameters
+    /// - `proc_path`: String specifies the path of the executable module for the process to open.
+    /// - `creation_flags`: Flags that control the priority class and creation of the process.
+    ///
+    /// # Returns
+    /// - `Ok(())`: If the process is successfully created.
+    /// - `Err(windows::core::Error)`: If the process creation fails.
+    pub fn spawn_process(
+        proc_path: &mut str,
+        creation_flags: PROCESS_CREATION_FLAGS,
+    ) -> Result<(), windows::core::Error> {
+        let mut si: STARTUPINFOA = STARTUPINFOA::default();
+        let mut pi: PROCESS_INFORMATION = PROCESS_INFORMATION::default();
+
+        // convert string 'proc_path' to PCSTR to
+        // use with CreateProces
+        let pcstr_pn = {
+            if proc_path.is_empty() {
+                PCSTR::null()
+            } else {
+                PCSTR::from_raw(proc_path.as_mut_ptr())
+            }
+        };
+
+        unsafe {
+            CreateProcessA(
+                pcstr_pn,
+                PSTR::null(),
+                None,
+                None,
+                false,
+                creation_flags,
+                None,
+                None,
+                &mut si as *mut STARTUPINFOA,
+                &mut pi as *mut PROCESS_INFORMATION,
+            )
+        }?;
+
+        Ok(())
     }
 
     /// Get all processes with 'name'
@@ -417,25 +434,20 @@ impl Process {
     /// A vector of `Process` instances representing all currently running processes.
     pub fn get_processes() -> Vec<Process> {
         // take a snapshot of all current processes
-        let snapshot: HANDLE =
-            unsafe { HANDLE(CreateToolhelp32Snapshot(tlhelp32::TH32CS_SNAPPROCESS, 0) as isize) };
-
-        if snapshot.is_invalid() {
-            return Vec::new();
-        }
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        let handle = match snapshot {
+            Ok(h) => h,
+            Err(_) => return Vec::new(),
+        };
 
         let mut process_entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
         process_entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
 
         // process first entry, add it to process list
-        if unsafe {
-            Process32FirstW(
-                HANDLE::as_mut_c_void(snapshot),
-                &mut process_entry as *mut PROCESSENTRY32W,
-            )
-        } == FALSE.0
-        {
-            HANDLE::cleanup(snapshot);
+        if unsafe { Process32FirstW(handle, &mut process_entry as *mut PROCESSENTRY32W).is_err() } {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
             return Vec::new();
         }
 
@@ -446,17 +458,14 @@ impl Process {
         processes.push(Process::from_process_entry(&process_entry));
 
         // iterate through all processes
-        while unsafe {
-            Process32NextW(
-                HANDLE::as_mut_c_void(snapshot),
-                &mut process_entry as *mut PROCESSENTRY32W,
-            )
-        } == TRUE.0
+        while unsafe { Process32NextW(handle, &mut process_entry as *mut PROCESSENTRY32W).is_ok() }
         {
             processes.push(Process::from_process_entry(&process_entry));
         }
 
-        HANDLE::cleanup(snapshot);
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
 
         processes
     }
@@ -509,7 +518,7 @@ impl Process {
     /// Ok(()) if the process was successfully terminated.
     /// Err(std::io::Error)` if an error occurred while opening or terminating the process.
     pub fn kill_process(pid: &Pid) -> Result<(), std::io::Error> {
-        let process = HANDLE::from_process_id(pid, PROCESS_VM_READ | PROCESS_QUERY_INFORMATION);
+        let process = Self::open_handle(pid, PROCESS_VM_READ | PROCESS_QUERY_INFORMATION);
 
         if process.is_none() {
             return Err(Error::new(
@@ -522,7 +531,7 @@ impl Process {
 
         unsafe {
             let term = TerminateProcess(handle, 0);
-            HANDLE::cleanup(handle);
+            let _ = CloseHandle(handle);
 
             if term.is_err() {
                 return Err(std::io::Error::new(
@@ -545,7 +554,7 @@ impl Process {
     /// - `Ok(Vec<String>)` A vector of strings representing the names of all loaded DLLs.
     /// - `Err(windows::core::Error)` An error if the process could not be opened or modules could not be enumerated.
     pub fn get_loaded_modules(pid: &Pid) -> Result<Vec<String>, windows::core::Error> {
-        let opt = HANDLE::from_process_id(pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ);
+        let opt = Self::open_handle(pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ);
         let mut modules: Vec<HMODULE> = vec![HMODULE::default(); 1024];
         let mut needed: u32 = 0;
         let handle = opt.unwrap_or_default();
@@ -567,7 +576,9 @@ impl Process {
         };
 
         if success.is_err() {
-            HANDLE::cleanup(handle);
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
             return Err(windows::core::Error::new(
                 HRESULT::default(),
                 "Failed to enumerate process modules",
@@ -583,7 +594,7 @@ impl Process {
 
         // get all loaded dlls/modules
         for module in &modules[1..] {
-            let mut name_buffer = vec![0u8; MAX_PATH];
+            let mut name_buffer = vec![0; MAX_PATH as usize];
             unsafe { GetModuleBaseNameA(handle, *module, &mut name_buffer) };
 
             if let Ok(name) = String::from_utf8(name_buffer) {
@@ -591,7 +602,9 @@ impl Process {
             }
         }
 
-        HANDLE::cleanup(handle);
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
 
         Ok(module_names)
     }

@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 memchr = { version = "2.5", optional = true }
 ntapi = { version = "0.4", optional = true }
-windows = { version = ">=0.54, <=0.57", optional = true }
+windows = { version = ">=0.54, <=0.57", optional = true, features = ["Win32_Foundation", "Win32_System_Diagnostics_ToolHelp"] }
 winapi = "0.3.9"
 tlhelp32 = "=1.0.3"
 
